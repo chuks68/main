@@ -40,6 +40,7 @@
 //! | `register_anonymous_verified`| Tier-1 path with external verifier call.   |
 //! | `revoke_proof`               | Admin action; mutates existing record.     |
 //! | `get_proof_status`           | Read-only query; must be sub-linear.       |
+//! | `get_config`                 | Aggregate read-only config snapshot.       |
 //!
 //! ## Variance policy
 //!
@@ -176,6 +177,9 @@ const MAX_MEM_REVOKE_PROOF: u64 = 600_000;
 
 const MAX_CPU_GET_PROOF_STATUS: u64 = 500_000;
 const MAX_MEM_GET_PROOF_STATUS: u64 = 400_000;
+
+const MAX_CPU_GET_CONFIG: u64 = 1_000_000;
+const MAX_MEM_GET_CONFIG: u64 = 600_000;
 
 const MAX_CPU_REGISTER_SEAL_WORST_CASE: u64 = 2_000_000;
 const MAX_MEM_REGISTER_SEAL_WORST_CASE: u64 = 1_500_000;
@@ -431,6 +435,46 @@ fn budget_get_proof_status_baseline() {
         MAX_CPU_GET_PROOF_STATUS,
         MAX_MEM_GET_PROOF_STATUS,
         "get_proof_status",
+    );
+}
+
+#[test]
+fn budget_get_config_baseline() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(HarpocratesRegistry, ());
+    let client = HarpocratesRegistryClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    let verifier = Address::generate(&env);
+    let pending_verifier = Address::generate(&env);
+    let guardian = Address::generate(&env);
+    let rev_root = b32(&env, 0x77);
+
+    client.init(&admin);
+    client.set_proof_ttl(&admin, &3_600u64);
+    client.set_timelock_min_delay_secs(&admin, &172_800u64);
+    client.set_verifier(&admin, &verifier);
+    client.schedule_verifier_rotation(&admin, &pending_verifier, &100u64, &10u64, &5u64);
+    client.set_guardian(&admin, &guardian);
+    client.set_revocation_root(&admin, &rev_root);
+    client.pause(&admin, &PAUSE_DOMAIN_ALL_REGISTRATION, &3_600u64);
+
+    let (cpu, mem, cfg) = measure(&env, || client.get_config());
+    assert_eq!(cfg.proof_ttl, 3_600);
+    assert_eq!(cfg.timelock_min_delay_secs, 172_800);
+    assert_eq!(cfg.verifier, Some(verifier));
+    assert_eq!(cfg.verifier_state.pending_verifier, Some(pending_verifier));
+    assert_eq!(cfg.guardian, Some(guardian));
+    assert_eq!(cfg.schema_version, SchemaVersion::V2 as u32);
+    assert_eq!(cfg.revocation_root, Some(rev_root));
+    assert_eq!(cfg.paused_domains, PAUSE_DOMAIN_ALL_REGISTRATION);
+    assert_within(
+        cpu,
+        mem,
+        MAX_CPU_GET_CONFIG,
+        MAX_MEM_GET_CONFIG,
+        "get_config",
     );
 }
 

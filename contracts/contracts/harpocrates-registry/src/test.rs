@@ -590,3 +590,192 @@ fn accepts_correct_domain_tag() {
     assert_eq!(record.tier, TIER_SILENT_WITNESS);
     assert_eq!(record.video_hash, video_hash);
 }
+
+// ── Aggregate configuration read tests (#721) ────────────────────────────────
+
+fn assert_config_matches_getters(client: &HarpocratesRegistryClient, cfg: &RegistryConfig) {
+    assert_eq!(cfg.proof_ttl, client.get_proof_ttl());
+    assert_eq!(
+        cfg.timelock_min_delay_secs,
+        client.get_timelock_min_delay_secs()
+    );
+    assert_eq!(cfg.verifier, client.get_verifier());
+    assert_eq!(cfg.verifier_state, client.get_verifier_state());
+    assert_eq!(cfg.guardian, client.get_guardian());
+    assert_eq!(cfg.schema_version, client.get_schema_version());
+    assert_eq!(cfg.revocation_root, client.get_revocation_root());
+
+    let mut expected_paused = 0u32;
+    for bit in [
+        PAUSE_DOMAIN_TIER1_REGISTRATION,
+        PAUSE_DOMAIN_TIER2_REGISTRATION,
+        PAUSE_DOMAIN_TIER3_REGISTRATION,
+    ] {
+        if client.is_paused(&bit) {
+            expected_paused |= bit;
+        }
+    }
+    assert_eq!(cfg.paused_domains, expected_paused);
+}
+
+#[test]
+fn get_config_works_before_and_after_init() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(HarpocratesRegistry, ());
+    let client = HarpocratesRegistryClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+
+    // Before init: returns uninitialized defaults matching individual getters.
+    let before = client.get_config();
+    assert_config_matches_getters(&client, &before);
+    assert_eq!(before.proof_ttl, DEFAULT_PROOF_TTL_SECS);
+    assert_eq!(
+        before.timelock_min_delay_secs,
+        DEFAULT_TIMELOCK_MIN_DELAY_SECS
+    );
+    assert_eq!(before.verifier, None);
+    assert_eq!(
+        before.verifier_state,
+        VerifierState {
+            active_verifier: None,
+            pending_verifier: None,
+            previous_verifier: None,
+            activation_ledger: 0,
+            overlap_window: 0,
+            rollback_window: 0,
+            rollback_window_end: 0,
+        }
+    );
+    assert_eq!(before.guardian, None);
+    assert_eq!(before.schema_version, SchemaVersion::V1 as u32);
+    assert_eq!(before.revocation_root, None);
+    assert_eq!(before.paused_domains, 0);
+
+    // After init: schema_version stamps to V2, other defaults stay intact.
+    client.init(&admin);
+    let after = client.get_config();
+    assert_config_matches_getters(&client, &after);
+    assert_eq!(after.schema_version, SchemaVersion::V2 as u32);
+}
+
+#[test]
+fn get_config_reflects_mutations_across_all_settings() {
+    let env = Env::default();
+    env.mock_all_auths();
+    env.ledger().set_timestamp(10_000);
+    env.ledger().set_sequence_number(5);
+
+    let contract_id = env.register(HarpocratesRegistry, ());
+    let client = HarpocratesRegistryClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    let verifier1 = env.register(MockNoirVerifier, ());
+    let verifier2 = env.register(MockNoirVerifierV2, ());
+    let guardian = Address::generate(&env);
+    let root1 = bytes32(&env, 0xA1);
+    let root2 = bytes32(&env, 0xB2);
+
+    // Simulate legacy V1 deployment before upgrade_storage so schema_version mutation is tested.
+    env.as_contract(&contract_id, || {
+        env.storage().persistent().set(&DataKey::Admin, &admin);
+    });
+    let initial = client.get_config();
+    assert_config_matches_getters(&client, &initial);
+    assert_eq!(initial.schema_version, SchemaVersion::V1 as u32);
+
+    // 1. Mutate schema_version via upgrade_storage.
+    client.upgrade_storage(&admin);
+    let cfg = client.get_config();
+    assert_config_matches_getters(&client, &cfg);
+    assert_eq!(cfg.schema_version, SchemaVersion::V2 as u32);
+
+    // 2. Mutate proof_ttl.
+    client.set_proof_ttl(&admin, &7_200u64);
+    let cfg = client.get_config();
+    assert_config_matches_getters(&client, &cfg);
+    assert_eq!(cfg.proof_ttl, 7_200);
+
+    // 3. Mutate timelock_min_delay_secs.
+    client.set_timelock_min_delay_secs(&admin, &172_800u64);
+    let cfg = client.get_config();
+    assert_config_matches_getters(&client, &cfg);
+    assert_eq!(cfg.timelock_min_delay_secs, 172_800);
+
+    // 4. Mutate verifier.
+    client.set_verifier(&admin, &verifier1);
+    let cfg = client.get_config();
+    assert_config_matches_getters(&client, &cfg);
+    assert_eq!(cfg.verifier, Some(verifier1.clone()));
+    assert_eq!(cfg.verifier_state.active_verifier, Some(verifier1.clone()));
+    assert_eq!(cfg.verifier_state.pending_verifier, None);
+
+    // 5. Mutate verifier_state (schedule and activate rotation).
+    client.schedule_verifier_rotation(&admin, &verifier2, &10u64, &5u64, &3u64);
+    let cfg = client.get_config();
+    assert_config_matches_getters(&client, &cfg);
+    assert_eq!(cfg.verifier_state.active_verifier, Some(verifier1.clone()));
+    assert_eq!(cfg.verifier_state.pending_verifier, Some(verifier2.clone()));
+    assert_eq!(cfg.verifier_state.activation_ledger, 10);
+
+    env.ledger().set_sequence_number(12);
+    client.activate_verifier_rotation(&admin);
+    let cfg = client.get_config();
+    assert_config_matches_getters(&client, &cfg);
+    assert_eq!(cfg.verifier, Some(verifier2.clone()));
+    assert_eq!(cfg.verifier_state.active_verifier, Some(verifier2));
+    assert_eq!(cfg.verifier_state.pending_verifier, None);
+    assert_eq!(cfg.verifier_state.previous_verifier, Some(verifier1));
+
+    // 6. Mutate guardian.
+    client.set_guardian(&admin, &guardian);
+    let cfg = client.get_config();
+    assert_config_matches_getters(&client, &cfg);
+    assert_eq!(cfg.guardian, Some(guardian.clone()));
+
+    // 7. Mutate revocation_root.
+    client.set_revocation_root(&admin, &root1);
+    let cfg = client.get_config();
+    assert_config_matches_getters(&client, &cfg);
+    assert_eq!(cfg.revocation_root, Some(root1));
+
+    client.set_revocation_root(&admin, &root2);
+    let cfg = client.get_config();
+    assert_config_matches_getters(&client, &cfg);
+    assert_eq!(cfg.revocation_root, Some(root2));
+
+    // 8. Mutate pause state per domain (pause, partial unpause, auto-expiry).
+    client.pause(&admin, &PAUSE_DOMAIN_TIER1_REGISTRATION, &1_000u64);
+    let cfg = client.get_config();
+    assert_config_matches_getters(&client, &cfg);
+    assert_eq!(cfg.paused_domains, PAUSE_DOMAIN_TIER1_REGISTRATION);
+
+    client.pause(
+        &guardian,
+        &(PAUSE_DOMAIN_TIER2_REGISTRATION | PAUSE_DOMAIN_TIER3_REGISTRATION),
+        &2_000u64,
+    );
+    let cfg = client.get_config();
+    assert_config_matches_getters(&client, &cfg);
+    assert_eq!(cfg.paused_domains, PAUSE_DOMAIN_ALL_REGISTRATION);
+
+    client.unpause(&admin, &PAUSE_DOMAIN_TIER2_REGISTRATION);
+    let cfg = client.get_config();
+    assert_config_matches_getters(&client, &cfg);
+    assert_eq!(
+        cfg.paused_domains,
+        PAUSE_DOMAIN_TIER1_REGISTRATION | PAUSE_DOMAIN_TIER3_REGISTRATION
+    );
+
+    // Advance past tier-1 expiry (10_000 + 1_000 = 11_000), while tier-3 (expires at 12_000) stays paused.
+    env.ledger().set_timestamp(11_000);
+    let cfg = client.get_config();
+    assert_config_matches_getters(&client, &cfg);
+    assert_eq!(cfg.paused_domains, PAUSE_DOMAIN_TIER3_REGISTRATION);
+
+    // Advance past tier-3 expiry (12_000).
+    env.ledger().set_timestamp(12_000);
+    let cfg = client.get_config();
+    assert_config_matches_getters(&client, &cfg);
+    assert_eq!(cfg.paused_domains, 0);
+}

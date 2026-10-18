@@ -342,6 +342,24 @@ pub struct VerifierState {
     pub rollback_window_end: u64,
 }
 
+/// Aggregate snapshot of the registry's operational configuration (#721).
+///
+/// Combines the individual configuration getters and the currently paused
+/// registration domains bitmask into a single read-only response so clients
+/// can inspect the operational state in one simulation.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RegistryConfig {
+    pub proof_ttl: u64,
+    pub timelock_min_delay_secs: u64,
+    pub verifier: Option<Address>,
+    pub verifier_state: VerifierState,
+    pub guardian: Option<Address>,
+    pub schema_version: u32,
+    pub revocation_root: Option<BytesN<32>>,
+    pub paused_domains: u32,
+}
+
 /// A verifier's declared circuit-version window (#343).
 ///
 /// Immutable record of what the active verifier was told it may check, plus
@@ -1707,6 +1725,49 @@ impl HarpocratesRegistry {
             .persistent()
             .get(&DataKey::SchemaVersion)
             .unwrap_or(SchemaVersion::V1 as u32)
+    }
+
+    /// Return the registry's operational configuration in one read-only call (#721).
+    ///
+    /// Safe to call both before and after `init`. Every field matches the
+    /// corresponding individual getter, and `paused_domains` is the bitwise-OR
+    /// of all registration domains that are currently paused (unexpired).
+    pub fn get_config(env: Env) -> RegistryConfig {
+        let proof_ttl = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ProofTtl)
+            .unwrap_or(DEFAULT_PROOF_TTL_SECS);
+        let timelock_min_delay_secs = get_timelock_min_delay(&env);
+        let verifier: Option<Address> = env.storage().persistent().get(&DataKey::Verifier);
+        let verifier_state = get_verifier_rotation_state(&env);
+        let guardian: Option<Address> = env.storage().persistent().get(&DataKey::Guardian);
+        let schema_version = env
+            .storage()
+            .persistent()
+            .get(&DataKey::SchemaVersion)
+            .unwrap_or(SchemaVersion::V1 as u32);
+        let revocation_root: Option<BytesN<32>> =
+            env.storage().persistent().get(&DataKey::RevocationRoot);
+
+        let now = env.ledger().timestamp();
+        let mut paused_domains = 0u32;
+        for bit in PAUSE_DOMAIN_SINGLE_BITS {
+            if domain_is_paused(&env, bit, now) {
+                paused_domains |= bit;
+            }
+        }
+
+        RegistryConfig {
+            proof_ttl,
+            timelock_min_delay_secs,
+            verifier,
+            verifier_state,
+            guardian,
+            schema_version,
+            revocation_root,
+            paused_domains,
+        }
     }
 
     pub fn propose_admin(env: Env, admin: Address, pending_admin: Address) {

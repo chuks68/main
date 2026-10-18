@@ -90,6 +90,8 @@ def check_dependencies(deps: list) -> bool:
     """
     Simulate dependency checks for dry run.
     In real implementation, this would check contract states.
+    Follow-up (#721): when wired to live RPC simulation, query the registry's
+    aggregate `get_config` entry point instead of polling individual getters.
     """
     # Simulate successful dependency resolution
     return True
