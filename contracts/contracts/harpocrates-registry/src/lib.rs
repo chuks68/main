@@ -863,6 +863,8 @@ pub struct LineageRegistered {
 
 /// Maximum number of simultaneously Open disputes allowed per proof.
 pub const MAX_OPEN_DISPUTES_PER_PROOF: u32 = 4;
+/// Maximum number of simultaneously Open disputes allowed across all proofs per reporter.
+pub const MAX_OPEN_DISPUTES_PER_REPORTER: u32 = 5;
 /// Minimum seconds between consecutive disputes by the same reporter on the
 /// same proof (24 hours).
 pub const REPORTER_COOLDOWN_SECS: u64 = 86_400;
@@ -911,10 +913,12 @@ pub struct DisputeRecord {
     /// Categorised reason for the dispute.
     pub reason: DisputeReason,
     /// Privacy-safe commitment: H(reporter_address_bytes || proof_id_bytes).
-    /// The reporter's actual address is never stored on-chain.
+    /// Used for the per-proof cooldown and emitted in events.
     pub reporter_hash: BytesN<32>,
     /// Off-chain commitment to the reporter's full evidence submission.
     pub commitment_hash: BytesN<32>,
+    /// Address of the reporter who opened this dispute.
+    pub reporter: Address,
     /// Current lifecycle state.
     pub status: DisputeStatus,
     /// Ledger timestamp when the dispute was opened.
@@ -1455,6 +1459,9 @@ pub enum DataKey {
     /// Counts open (non-terminal) disputes for a proof_id (#dispute).
     /// Used to enforce MAX_OPEN_DISPUTES_PER_PROOF.
     ProofOpenDisputeCount(BytesN<32>),
+    /// Counts open (non-terminal) disputes across all proofs for a reporter Address.
+    /// Used to enforce MAX_OPEN_DISPUTES_PER_REPORTER.
+    ReporterOpenDisputeCount(Address),
     /// Tracks the last-opened timestamp for a reporter_hash/proof pair.
     /// Key is the caller-supplied `reporter_hash` (a 32-byte commitment).
     ReporterCooldown(BytesN<32>),
@@ -1614,6 +1621,8 @@ pub enum RegistryError {
     /// than [`verifier_inputs::EXPECTED_CIRCUIT_VERSION`], or was the superseded
     /// bare 224-byte frame that commits no circuit version at all (#368).
     CircuitVersionMismatch = 87,
+    /// The reporter reached `MAX_OPEN_DISPUTES_PER_REPORTER`.
+    ReporterDisputesSaturated = 88,
 }
 
 #[contract]
@@ -4293,6 +4302,17 @@ impl HarpocratesRegistry {
             panic_with_error!(&env, RegistryError::TooManyOpenDisputes);
         }
 
+        // 3b. Cap open disputes per reporter across all proofs.
+        let reporter_count_key = DataKey::ReporterOpenDisputeCount(reporter.clone());
+        let reporter_open_count: u32 = env
+            .storage()
+            .persistent()
+            .get(&reporter_count_key)
+            .unwrap_or(0u32);
+        if reporter_open_count >= MAX_OPEN_DISPUTES_PER_REPORTER {
+            panic_with_error!(&env, RegistryError::ReporterDisputesSaturated);
+        }
+
         // 4. Reporter cooldown (keyed by the privacy-safe reporter_hash).
         let cooldown_key = DataKey::ReporterCooldown(reporter_hash.clone());
         let last_open: u64 = env
@@ -4318,6 +4338,7 @@ impl HarpocratesRegistry {
             reason,
             reporter_hash: reporter_hash.clone(),
             commitment_hash: commitment_hash.clone(),
+            reporter: reporter.clone(),
             status: DisputeStatus::Open,
             opened_at: now,
             respond_deadline,
@@ -4330,11 +4351,14 @@ impl HarpocratesRegistry {
             .persistent()
             .set(&DataKey::Dispute(dispute_id.clone()), &record);
 
-        // 8. Increment open-dispute counter.
+        // 8. Increment open-dispute counters (per proof and per reporter).
         env.storage().persistent().set(
             &DataKey::ProofOpenDisputeCount(proof_id.clone()),
             &(open_count + 1),
         );
+        env.storage()
+            .persistent()
+            .set(&reporter_count_key, &(reporter_open_count + 1));
 
         // 9. Emit event.
         DisputeOpened {
@@ -4458,8 +4482,9 @@ impl HarpocratesRegistry {
             .persistent()
             .set(&DataKey::Dispute(dispute_id.clone()), &record);
 
-        // Decrement open-dispute counter.
+        // Decrement open-dispute counters (per proof and per reporter).
         decrement_open_dispute_count(&env, &record.proof_id);
+        decrement_reporter_open_dispute_count(&env, &record.reporter);
 
         DisputeResolved {
             dispute_id,
@@ -4496,8 +4521,9 @@ impl HarpocratesRegistry {
             .persistent()
             .set(&DataKey::Dispute(dispute_id.clone()), &record);
 
-        // Decrement open-dispute counter.
+        // Decrement open-dispute counters (per proof and per reporter).
         decrement_open_dispute_count(&env, &record.proof_id);
+        decrement_reporter_open_dispute_count(&env, &record.reporter);
 
         DisputeDismissed {
             dispute_id,
@@ -4569,8 +4595,9 @@ impl HarpocratesRegistry {
         // Record the reverse supersession direction for cycle detection.
         record_supersession_direction(&env, &record.proof_id, &superseding_proof_id);
 
-        // Decrement open-dispute counter.
+        // Decrement open-dispute counters (per proof and per reporter).
         decrement_open_dispute_count(&env, &record.proof_id);
+        decrement_reporter_open_dispute_count(&env, &record.reporter);
 
         DisputeSuperseded {
             dispute_id,
@@ -4595,6 +4622,15 @@ impl HarpocratesRegistry {
         env.storage()
             .persistent()
             .get(&DataKey::ProofOpenDisputeCount(proof_id))
+            .unwrap_or(0u32)
+    }
+
+    /// Return the number of currently open (non-terminal) disputes opened by
+    /// `reporter` across all proofs.
+    pub fn get_reporter_open_dispute_count(env: Env, reporter: Address) -> u32 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::ReporterOpenDisputeCount(reporter))
             .unwrap_or(0u32)
     }
 
@@ -5802,6 +5838,19 @@ fn get_dispute_record(env: &Env, dispute_id: &BytesN<32>) -> DisputeRecord {
 /// but is defended against for safety).
 fn decrement_open_dispute_count(env: &Env, proof_id: &BytesN<32>) {
     let key = DataKey::ProofOpenDisputeCount(proof_id.clone());
+    let count: u32 = env.storage().persistent().get(&key).unwrap_or(0u32);
+    let new_count = count.saturating_sub(1);
+    if new_count == 0 {
+        env.storage().persistent().remove(&key);
+    } else {
+        env.storage().persistent().set(&key, &new_count);
+    }
+}
+
+/// Decrement the per-reporter open-dispute counter. Saturates at 0 and
+/// removes the key when it reaches zero so idle reporters hold no storage.
+fn decrement_reporter_open_dispute_count(env: &Env, reporter: &Address) {
+    let key = DataKey::ReporterOpenDisputeCount(reporter.clone());
     let count: u32 = env.storage().persistent().get(&key).unwrap_or(0u32);
     let new_count = count.saturating_sub(1);
     if new_count == 0 {
