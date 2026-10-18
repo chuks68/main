@@ -280,3 +280,65 @@ fn legacy_admin_issuer_record_cannot_seal_before_migration_runs() {
         &b32(&env, 0x43),
     );
 }
+
+// ---------------------------------------------------------------------------
+// Issuer metadata update tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn update_issuer_metadata_succeeds_and_emits_event_once() {
+    let (env, contract_id, admin) = setup();
+    let client = HarpocratesRegistryClient::new(&env, &contract_id);
+    let issuer = Address::generate(&env);
+    let initial_hash = b32(&env, 0x11);
+    let updated_hash = b32(&env, 0x22);
+
+    client.add_issuer(&admin, &issuer, &initial_hash);
+    let before = client.get_issuer(&issuer).unwrap();
+    assert_eq!(before.metadata_hash, initial_hash);
+    assert!(before.active);
+
+    client.update_issuer_metadata(&admin, &issuer, &updated_hash);
+
+    let after = client.get_issuer(&issuer).unwrap();
+    assert_eq!(after.metadata_hash, updated_hash);
+    assert!(after.active); // only metadata hash changes
+
+    assert_eq!(event_test_utils::count_events(&env, &["issuer", "metadata"]), 1);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #8)")] // UnknownIssuer
+fn update_issuer_metadata_fails_for_unknown_issuer() {
+    let (env, contract_id, admin) = setup();
+    let client = HarpocratesRegistryClient::new(&env, &contract_id);
+    let unknown = Address::generate(&env);
+
+    client.update_issuer_metadata(&admin, &unknown, &b32(&env, 0x33));
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #8)")] // UnknownIssuer
+fn update_issuer_metadata_fails_for_revoked_issuer() {
+    let (env, contract_id, admin) = setup();
+    let client = HarpocratesRegistryClient::new(&env, &contract_id);
+    let issuer = Address::generate(&env);
+
+    client.add_issuer(&admin, &issuer, &b32(&env, 0x11));
+    client.revoke_issuer(&admin, &issuer);
+
+    client.update_issuer_metadata(&admin, &issuer, &b32(&env, 0x33));
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #3)")] // Unauthorized
+fn update_issuer_metadata_fails_for_non_admin_caller() {
+    let (env, contract_id, admin) = setup();
+    let client = HarpocratesRegistryClient::new(&env, &contract_id);
+    let issuer = Address::generate(&env);
+    let stranger = Address::generate(&env);
+
+    client.add_issuer(&admin, &issuer, &b32(&env, 0x11));
+
+    client.update_issuer_metadata(&stranger, &issuer, &b32(&env, 0x33));
+}

@@ -703,6 +703,14 @@ pub struct IssuerRevoked {
     pub issuer: Address,
 }
 
+#[contractevent(topics = ["issuer", "metadata"])]
+pub struct IssuerMetadataUpdated {
+    #[topic]
+    pub issuer: Address,
+    pub previous_metadata_hash: BytesN<32>,
+    pub new_metadata_hash: BytesN<32>,
+}
+
 /// Emitted when an active issuer key rotates to a replacement (#323).
 ///
 /// Carries addresses, ledger time, and the grace bound only — never key
@@ -2083,6 +2091,43 @@ impl HarpocratesRegistry {
             .persistent()
             .remove(&DataKey::IssuerRotation(issuer.clone()));
         IssuerRevoked { issuer }.publish(&env);
+    }
+
+    /// Update an active issuer's metadata hash without revoking and re-adding.
+    ///
+    /// Requires admin auth and that `issuer` is active.
+    /// Only the metadata hash changes; active status and any rotation grace
+    /// records are preserved.
+    ///
+    /// # Reverts
+    ///
+    /// - `Unauthorized` if `admin` is not the current admin
+    /// - `UnknownIssuer` if `issuer` does not exist or is inactive
+    pub fn update_issuer_metadata(
+        env: Env,
+        admin: Address,
+        issuer: Address,
+        metadata_hash: BytesN<32>,
+    ) {
+        require_admin(&env, &admin);
+
+        let mut record = get_issuer_record(&env, &issuer);
+        if !record.active {
+            panic_with_error!(&env, RegistryError::UnknownIssuer);
+        }
+
+        let previous_metadata_hash = record.metadata_hash;
+        record.metadata_hash = metadata_hash.clone();
+        env.storage()
+            .persistent()
+            .set(&DataKey::Issuer(issuer.clone()), &record);
+
+        IssuerMetadataUpdated {
+            issuer,
+            previous_metadata_hash,
+            new_metadata_hash: metadata_hash,
+        }
+        .publish(&env);
     }
 
     /// Rotate an active issuer key to a replacement, opening a bounded grace

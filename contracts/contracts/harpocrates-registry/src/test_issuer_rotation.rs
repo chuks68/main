@@ -502,3 +502,32 @@ fn reads_fail_closed_for_unknown_issuers() {
     assert!(client.get_issuer_rotation(&unknown).is_none());
     assert!(!client.is_issuer_verifiable(&unknown));
 }
+
+#[test]
+fn update_issuer_metadata_preserves_rotation_records() {
+    let (env, contract_id, admin, previous, replacement) = setup(1_000);
+    let client = HarpocratesRegistryClient::new(&env, &contract_id);
+
+    client.rotate_issuer(&admin, &previous, &replacement, &ONE_DAY);
+
+    let initial_rotation = client.get_issuer_rotation(&previous).unwrap();
+    assert_eq!(initial_rotation.previous_issuer, previous);
+    assert_eq!(initial_rotation.replacement_issuer, replacement);
+
+    // Update replacement issuer metadata
+    let new_metadata = b32(&env, 0xFE);
+    client.update_issuer_metadata(&admin, &replacement, &new_metadata);
+
+    // Metadata updated
+    assert_eq!(
+        client.get_issuer(&replacement).unwrap().metadata_hash,
+        new_metadata
+    );
+
+    // Previous issuer's rotation record is preserved intact
+    let post_update_rotation = client.get_issuer_rotation(&previous).unwrap();
+    assert_eq!(post_update_rotation, initial_rotation);
+
+    // Retired issuer is still verifiable within grace window
+    assert!(client.is_issuer_verifiable(&previous));
+}
