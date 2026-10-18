@@ -177,6 +177,9 @@ const MAX_MEM_REVOKE_PROOF: u64 = 600_000;
 const MAX_CPU_GET_PROOF_STATUS: u64 = 500_000;
 const MAX_MEM_GET_PROOF_STATUS: u64 = 400_000;
 
+const MAX_CPU_GET_PROOF_ASSURANCE: u64 = 800_000;
+const MAX_MEM_GET_PROOF_ASSURANCE: u64 = 600_000;
+
 const MAX_CPU_REGISTER_SEAL_WORST_CASE: u64 = 2_000_000;
 const MAX_MEM_REGISTER_SEAL_WORST_CASE: u64 = 1_500_000;
 
@@ -431,6 +434,33 @@ fn budget_get_proof_status_baseline() {
         MAX_CPU_GET_PROOF_STATUS,
         MAX_MEM_GET_PROOF_STATUS,
         "get_proof_status",
+    );
+}
+
+#[test]
+fn budget_get_proof_assurance_baseline() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(HarpocratesRegistry, ());
+    let client = HarpocratesRegistryClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    let source = Address::generate(&env);
+    let proof_id = b32(&env, 0x51);
+
+    client.init(&admin);
+    client.register_source(&source, &b32(&env, 0x52), &b32(&env, 0x53), &proof_id);
+
+    let (cpu, mem, assurance) = measure(&env, || client.get_proof_assurance(&proof_id));
+    assert!(assurance.is_some());
+    let assurance = assurance.unwrap();
+    assert_eq!(assurance.status, ProofVerificationStatus::Valid);
+    assert_within(
+        cpu,
+        mem,
+        MAX_CPU_GET_PROOF_ASSURANCE,
+        MAX_MEM_GET_PROOF_ASSURANCE,
+        "get_proof_assurance",
     );
 }
 

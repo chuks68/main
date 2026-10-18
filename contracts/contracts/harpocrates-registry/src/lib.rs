@@ -454,6 +454,29 @@ pub enum ProofVerificationStatus {
     NotFound,
 }
 
+/// Comprehensive proof assurance view combining status, tier, timestamp assurance,
+/// dispute count, envelope version, and issuer verifiability in a single call.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProofAssurance {
+    pub status: ProofVerificationStatus,
+    pub tier: u32,
+    pub timestamp_assurance_level: u32,
+    pub open_dispute_count: u32,
+    pub envelope_version: u32,
+    pub issuer_verifiable: bool,
+}
+
+impl ProofAssurance {
+    pub fn timestamp_assurance(&self) -> u32 {
+        self.timestamp_assurance_level
+    }
+
+    pub fn is_issuer_verifiable(&self) -> bool {
+        self.issuer_verifiable
+    }
+}
+
 /// On-chain lineage edge for a verifiable derivative.
 ///
 /// `parent_proof_ids` retain graph topology for cycle/depth checks.
@@ -703,6 +726,14 @@ pub struct IssuerRevoked {
     pub issuer: Address,
 }
 
+#[contractevent(topics = ["issuer", "metadata"])]
+pub struct IssuerMetadataUpdated {
+    #[topic]
+    pub issuer: Address,
+    pub previous_metadata_hash: BytesN<32>,
+    pub new_metadata_hash: BytesN<32>,
+}
+
 /// Emitted when an active issuer key rotates to a replacement (#323).
 ///
 /// Carries addresses, ledger time, and the grace bound only — never key
@@ -863,6 +894,8 @@ pub struct LineageRegistered {
 
 /// Maximum number of simultaneously Open disputes allowed per proof.
 pub const MAX_OPEN_DISPUTES_PER_PROOF: u32 = 4;
+/// Maximum number of simultaneously Open disputes allowed across all proofs per reporter.
+pub const MAX_OPEN_DISPUTES_PER_REPORTER: u32 = 5;
 /// Minimum seconds between consecutive disputes by the same reporter on the
 /// same proof (24 hours).
 pub const REPORTER_COOLDOWN_SECS: u64 = 86_400;
@@ -915,6 +948,8 @@ pub struct DisputeRecord {
     pub reporter_hash: BytesN<32>,
     /// Off-chain commitment to the reporter's full evidence submission.
     pub commitment_hash: BytesN<32>,
+    /// Address of the reporter who opened this dispute.
+    pub reporter: Address,
     /// Current lifecycle state.
     pub status: DisputeStatus,
     /// Ledger timestamp when the dispute was opened.
@@ -1455,6 +1490,9 @@ pub enum DataKey {
     /// Counts open (non-terminal) disputes for a proof_id (#dispute).
     /// Used to enforce MAX_OPEN_DISPUTES_PER_PROOF.
     ProofOpenDisputeCount(BytesN<32>),
+    /// Counts open (non-terminal) disputes across all proofs for a reporter Address.
+    /// Used to enforce MAX_OPEN_DISPUTES_PER_REPORTER.
+    ReporterOpenDisputeCount(Address),
     /// Tracks the last-opened timestamp for a reporter_hash/proof pair.
     /// Key is the caller-supplied `reporter_hash` (a 32-byte commitment).
     ReporterCooldown(BytesN<32>),
@@ -1614,6 +1652,8 @@ pub enum RegistryError {
     /// than [`verifier_inputs::EXPECTED_CIRCUIT_VERSION`], or was the superseded
     /// bare 224-byte frame that commits no circuit version at all (#368).
     CircuitVersionMismatch = 87,
+    /// The reporter reached `MAX_OPEN_DISPUTES_PER_REPORTER`.
+    ReporterDisputesSaturated = 88,
 }
 
 #[contract]
@@ -2085,6 +2125,43 @@ impl HarpocratesRegistry {
         IssuerRevoked { issuer }.publish(&env);
     }
 
+    /// Update an active issuer's metadata hash.
+    ///
+    /// Requires admin auth and that `issuer` is active.
+    /// Only the metadata hash changes; active status and any rotation grace
+    /// records are preserved.
+    ///
+    /// # Reverts
+    ///
+    /// - `Unauthorized` if `admin` is not the current admin
+    /// - `UnknownIssuer` if `issuer` does not exist or is inactive
+    pub fn update_issuer_metadata(
+        env: Env,
+        admin: Address,
+        issuer: Address,
+        metadata_hash: BytesN<32>,
+    ) {
+        require_admin(&env, &admin);
+
+        let mut record = get_issuer_record(&env, &issuer);
+        if !record.active {
+            panic_with_error!(&env, RegistryError::UnknownIssuer);
+        }
+
+        let previous_metadata_hash = record.metadata_hash;
+        record.metadata_hash = metadata_hash.clone();
+        env.storage()
+            .persistent()
+            .set(&DataKey::Issuer(issuer.clone()), &record);
+
+        IssuerMetadataUpdated {
+            issuer,
+            previous_metadata_hash,
+            new_metadata_hash: metadata_hash,
+        }
+        .publish(&env);
+    }
+
     /// Rotate an active issuer key to a replacement, opening a bounded grace
     /// window over the retiring key's pre-rotation evidence (#323).
     ///
@@ -2467,6 +2544,34 @@ impl HarpocratesRegistry {
             statuses.push_back(Self::get_proof_status(env.clone(), proof_id));
         }
         statuses
+    }
+
+    /// Single read call that summarises everything a verifier needs to trust a proof:
+    /// verification status, tier, timestamp assurance level, open dispute count,
+    /// metadata envelope version, and issuer verifiability.
+    ///
+    /// Returns `None` if the proof is not found.
+    pub fn get_proof_assurance(env: Env, proof_id: BytesN<32>) -> Option<ProofAssurance> {
+        let record: ProofRecord = env.storage().persistent().get(&DataKey::Proof(proof_id.clone()))?;
+        let status = Self::get_proof_status(env.clone(), proof_id.clone());
+        let timestamp_assurance_level = Self::get_timestamp_claim(env.clone(), proof_id.clone())
+            .map(|c| c.assurance)
+            .unwrap_or(TIMESTAMP_ASSURANCE_NONE);
+        let open_dispute_count = Self::get_open_dispute_count(env.clone(), proof_id.clone());
+        let envelope_version = Self::resolve_metadata_envelope_ver(env.clone(), proof_id.clone());
+        let issuer_verifiable = match record.issuer {
+            Some(issuer) => Self::is_issuer_verifiable(env.clone(), issuer),
+            None => false,
+        };
+
+        Some(ProofAssurance {
+            status,
+            tier: record.tier,
+            timestamp_assurance_level,
+            open_dispute_count,
+            envelope_version,
+            issuer_verifiable,
+        })
     }
 
     // -----------------------------------------------------------------------
