@@ -39,7 +39,10 @@
 //! | `register_anonymous`         | Tier-1 path with nullifier + ZK boundary.  |
 //! | `register_anonymous_verified`| Tier-1 path with external verifier call.   |
 //! | `revoke_proof`               | Admin action; mutates existing record.     |
+//! | `revoke_proofs`              | Admin action; batch mutates up to 20 records. |
 //! | `get_proof_status`           | Read-only query; must be sub-linear.       |
+//! | `list_lineage_children`      | Read-only query; full page read bounds.    |
+//! | `list_credential_roots`      | Read-only query; paginates credential roots.|
 //!
 //! ## Variance policy
 //!
@@ -174,11 +177,24 @@ const MAX_MEM_REGISTER_ANONYMOUS_VERIFIED: u64 = 2_000_000;
 const MAX_CPU_REVOKE_PROOF: u64 = 800_000;
 const MAX_MEM_REVOKE_PROOF: u64 = 600_000;
 
+const MAX_CPU_REVOKE_PROOFS_WORST_CASE: u64 = 15_000_000;
+const MAX_MEM_REVOKE_PROOFS_WORST_CASE: u64 = 10_000_000;
+
 const MAX_CPU_GET_PROOF_STATUS: u64 = 500_000;
 const MAX_MEM_GET_PROOF_STATUS: u64 = 400_000;
 
+const MAX_CPU_GET_PROOF_ASSURANCE: u64 = 800_000;
+const MAX_MEM_GET_PROOF_ASSURANCE: u64 = 600_000;
+
 const MAX_CPU_REGISTER_SEAL_WORST_CASE: u64 = 2_000_000;
 const MAX_MEM_REGISTER_SEAL_WORST_CASE: u64 = 1_500_000;
+
+const MAX_CPU_REGISTER_SOURCE_BATCH: u64 = 1_200_000;
+const MAX_MEM_REGISTER_SOURCE_BATCH: u64 = 1_000_000;
+
+const MAX_CPU_VERIFY_SOURCE_BATCH_MAX_PROOF: u64 = 1_500_000;
+const MAX_MEM_VERIFY_SOURCE_BATCH_MAX_PROOF: u64 = 1_000_000;
+
 
 // ---------------------------------------------------------------------------
 // Budget baseline tests (measurement)
@@ -410,6 +426,40 @@ fn budget_revoke_proof_baseline() {
 }
 
 #[test]
+fn budget_revoke_proofs_worst_case() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(HarpocratesRegistry, ());
+    let client = HarpocratesRegistryClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    let source = Address::generate(&env);
+
+    client.init(&admin);
+
+    let mut proof_ids = SorobanVec::new(&env);
+    for i in 0..MAX_REVOKE_PROOFS_BATCH_SIZE as u8 {
+        let proof_id = b32(&env, 0x60 + i);
+        client.register_source(
+            &source,
+            &b32(&env, 0x70 + i),
+            &b32(&env, 0x80 + i),
+            &proof_id,
+        );
+        proof_ids.push_back(proof_id);
+    }
+
+    let (cpu, mem, _) = measure(&env, || client.revoke_proofs(&admin, &proof_ids, &1));
+    assert_within(
+        cpu,
+        mem,
+        MAX_CPU_REVOKE_PROOFS_WORST_CASE,
+        MAX_MEM_REVOKE_PROOFS_WORST_CASE,
+        "revoke_proofs",
+    );
+}
+
+#[test]
 fn budget_get_proof_status_baseline() {
     let env = Env::default();
     env.mock_all_auths();
@@ -431,6 +481,33 @@ fn budget_get_proof_status_baseline() {
         MAX_CPU_GET_PROOF_STATUS,
         MAX_MEM_GET_PROOF_STATUS,
         "get_proof_status",
+    );
+}
+
+#[test]
+fn budget_get_proof_assurance_baseline() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(HarpocratesRegistry, ());
+    let client = HarpocratesRegistryClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    let source = Address::generate(&env);
+    let proof_id = b32(&env, 0x51);
+
+    client.init(&admin);
+    client.register_source(&source, &b32(&env, 0x52), &b32(&env, 0x53), &proof_id);
+
+    let (cpu, mem, assurance) = measure(&env, || client.get_proof_assurance(&proof_id));
+    assert!(assurance.is_some());
+    let assurance = assurance.unwrap();
+    assert_eq!(assurance.status, ProofVerificationStatus::Valid);
+    assert_within(
+        cpu,
+        mem,
+        MAX_CPU_GET_PROOF_ASSURANCE,
+        MAX_MEM_GET_PROOF_ASSURANCE,
+        "get_proof_assurance",
     );
 }
 
@@ -678,5 +755,113 @@ fn budget_receipt_commit_baseline() {
         MAX_CPU_COMMIT_RECEIPT,
         MAX_MEM_COMMIT_RECEIPT,
         "commit_receipt_digest",
+    );
+}
+
+const MAX_CPU_LIST_LINEAGE_CHILDREN_PAGE: u64 = 6_000_000;
+const MAX_MEM_LIST_LINEAGE_CHILDREN_PAGE: u64 = 1_500_000;
+
+/// Baseline for `list_lineage_children` at `MAX_LINEAGE_CHILDREN_PAGE` (50 entries).
+///
+/// Registers enough children for a full page and records CPU/memory for one
+/// `list_lineage_children` call, asserting it stays within resource thresholds.
+#[test]
+fn budget_list_lineage_children_full_page_baseline() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(HarpocratesRegistry, ());
+    let client = HarpocratesRegistryClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    let actor = Address::generate(&env);
+    let parent = b32(&env, 0x10);
+
+    client.init(&admin);
+    client.register_source(&actor, &b32(&env, 0x11), &b32(&env, 0x12), &parent);
+
+    // Register MAX_LINEAGE_CHILDREN_PAGE (50) children
+    let mut expected_children = SorobanVec::new(&env);
+    for i in 0..MAX_LINEAGE_CHILDREN_PAGE {
+        let mut child_arr = [0x20u8; 32];
+        child_arr[0] = (i & 0xFF) as u8;
+        child_arr[1] = ((i >> 8) & 0xFF) as u8;
+        let child = BytesN::from_array(&env, &child_arr);
+
+        let mut manifest_arr = [0x30u8; 32];
+        manifest_arr[0] = (i & 0xFF) as u8;
+        manifest_arr[1] = ((i >> 8) & 0xFF) as u8;
+        let manifest = BytesN::from_array(&env, &manifest_arr);
+
+        client.register_lineage(
+            &actor,
+            &SorobanVec::from_array(&env, [parent.clone()]),
+            &manifest,
+            &Symbol::new(&env, "crop"),
+            &child,
+            &1,
+        );
+        expected_children.push_back(child);
+    }
+
+    assert_eq!(
+        client.get_lineage_children_count(&parent),
+        MAX_LINEAGE_CHILDREN_PAGE
+    );
+
+    // Measure reading a full page of MAX_LINEAGE_CHILDREN_PAGE entries
+    let (cpu, mem, page) = measure(&env, || {
+        client.list_lineage_children(&parent, &0, &MAX_LINEAGE_CHILDREN_PAGE)
+    });
+
+    assert_eq!(page.total, MAX_LINEAGE_CHILDREN_PAGE);
+    assert_eq!(page.next_offset, MAX_LINEAGE_CHILDREN_PAGE);
+    assert_eq!(page.children.len(), MAX_LINEAGE_CHILDREN_PAGE);
+    assert_eq!(page.children, expected_children);
+
+    assert_within(
+        cpu,
+        mem,
+        MAX_CPU_LIST_LINEAGE_CHILDREN_PAGE,
+        MAX_MEM_LIST_LINEAGE_CHILDREN_PAGE,
+        "list_lineage_children full page",
+    );
+}
+
+const MAX_CPU_LIST_CREDENTIAL_ROOTS_PAGE: u64 = 4_000_000;
+const MAX_MEM_LIST_CREDENTIAL_ROOTS_PAGE: u64 = 1_500_000;
+
+/// Baseline for `list_credential_roots` at `MAX_CREDENTIAL_ROOTS_PAGE` (25 entries).
+#[test]
+fn budget_list_credential_roots_full_page_baseline() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(HarpocratesRegistry, ());
+    let client = HarpocratesRegistryClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    client.init(&admin);
+
+    for i in 1..=MAX_CREDENTIAL_ROOTS_PAGE {
+        client.add_credential_root(&admin, &b32(&env, i as u8), &b32(&env, 0xEE));
+    }
+
+    assert_eq!(
+        client.get_credential_root_count(),
+        MAX_CREDENTIAL_ROOTS_PAGE
+    );
+
+    let (cpu, mem, page) = measure(&env, || {
+        client.list_credential_roots(&0, &MAX_CREDENTIAL_ROOTS_PAGE)
+    });
+
+    assert_eq!(page.roots.len(), MAX_CREDENTIAL_ROOTS_PAGE);
+    assert_eq!(page.next_cursor, None);
+
+    assert_within(
+        cpu,
+        mem,
+        MAX_CPU_LIST_CREDENTIAL_ROOTS_PAGE,
+        MAX_MEM_LIST_CREDENTIAL_ROOTS_PAGE,
+        "list_credential_roots full page",
     );
 }

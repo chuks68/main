@@ -1,6 +1,7 @@
 #![cfg(test)]
 
 use super::*;
+use soroban_sdk::String;
 use soroban_sdk::{
     contract, contractimpl,
     testutils::{Address as _, Events as _, Ledger},
@@ -82,8 +83,40 @@ fn silent_public_inputs(
     Bytes::from_array(env, &bytes)
 }
 
+fn browser_silent_public_inputs(
+    env: &Env,
+    video_hash: &BytesN<32>,
+    credential_root: &BytesN<32>,
+    nullifier: &BytesN<32>,
+) -> Bytes {
+    let mut video_hash_bytes = [0u8; 32];
+    video_hash.copy_into_slice(&mut video_hash_bytes);
+
+    let mut credential_root_bytes = [0u8; 32];
+    credential_root.copy_into_slice(&mut credential_root_bytes);
+
+    let mut nullifier_bytes = [0u8; 32];
+    nullifier.copy_from_slice(&mut nullifier_bytes);
+
+    // 4 public inputs × 32 bytes = 128 bytes
+    let mut bytes = [0u8; 128];
+    bytes[16..32].copy_from_slice(&video_hash_bytes[..16]);
+    bytes[48..64].copy_from_slice(&video_hash_bytes[16..]);
+    bytes[64..96].copy_from_slice(&credential_root_bytes);
+    bytes[96..128].copy_from_slice(&nullifier_bytes);
+
+    Bytes::from_array(env, &bytes)
+}
+
 fn expected_domain_tag_test(env: &Env) -> BytesN<32> {
     expected_domain_tag(env)
+}
+
+#[test]
+fn returns_cargo_package_version() {
+    let env = Env::default();
+    let expected = String::from_str(&env, env!("CARGO_PKG_VERSION"));
+    assert_eq!(version(env), expected);
 }
 
 #[test]
@@ -220,6 +253,38 @@ fn registers_silent_witness_through_external_verifier() {
     assert_eq!(record.nullifier, Some(nullifier.clone()));
     assert!(client.has_nullifier(&client.get_verifier().unwrap(), &nullifier));
     // Non-batch registration has batch_size = 0
+    assert_eq!(record.batch_size, 0);
+}
+
+#[test]
+fn registers_silent_witness_browser_128_byte_frame() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(HarpocratesRegistry, ());
+    let verifier_id = env.register(MockNoirVerifier, ());
+    let client = HarpocratesRegistryClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    let video_hash = bytes32(&env, 41);
+    let credential_root = bytes32(&env, 9);
+    let nullifier = bytes32(&env, 42);
+
+    client.init(&admin);
+    client.set_verifier(&admin, &verifier_id);
+    client.add_credential_root(&admin, &credential_root, &bytes32(&env, 45));
+
+    let record = client.register_anonymous_verified(
+        &video_hash,
+        &bytes32(&env, 43),
+        &bytes32(&env, 44),
+        &browser_silent_public_inputs(&env, &video_hash, &credential_root, &nullifier),
+        &proof_bytes(&env),
+    );
+
+    assert_eq!(record.tier, TIER_SILENT_WITNESS);
+    assert_eq!(record.video_hash, video_hash);
+    assert_eq!(record.nullifier, Some(nullifier.clone()));
+    assert!(client.has_nullifier(&client.get_verifier().unwrap(), &nullifier));
     assert_eq!(record.batch_size, 0);
 }
 
@@ -589,4 +654,208 @@ fn accepts_correct_domain_tag() {
 
     assert_eq!(record.tier, TIER_SILENT_WITNESS);
     assert_eq!(record.video_hash, video_hash);
+}
+
+// ---------------------------------------------------------------------------
+// Proof assurance tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_assurance_unknown_proof_returns_none() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(HarpocratesRegistry, ());
+    let client = HarpocratesRegistryClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    client.init(&admin);
+
+    let unknown_proof_id = bytes32(&env, 0x99);
+    assert_eq!(client.get_proof_assurance(&unknown_proof_id), None);
+}
+
+#[test]
+fn test_assurance_registered_seal_with_active_and_deactivated_issuer() {
+    let env = Env::default();
+    env.mock_all_auths();
+    env.ledger().set_timestamp(1_000_000);
+
+    let contract_id = env.register(HarpocratesRegistry, ());
+    let client = HarpocratesRegistryClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    let issuer = Address::generate(&env);
+
+    client.init(&admin);
+    client.add_issuer(&admin, &issuer, &bytes32(&env, 0xAA));
+
+    let proof_id = bytes32(&env, 0x01);
+    client.register_seal(&issuer, &bytes32(&env, 0x02), &bytes32(&env, 0x03), &proof_id);
+
+    let assurance = client.get_proof_assurance(&proof_id).expect("proof assurance");
+    assert_eq!(assurance.status, ProofVerificationStatus::Valid);
+    assert_eq!(assurance.status, client.get_proof_status(&proof_id));
+    assert_eq!(assurance.tier, TIER_PUBLIC_SEAL);
+    assert_eq!(assurance.timestamp_assurance_level, TIMESTAMP_ASSURANCE_NONE);
+    assert_eq!(assurance.timestamp_assurance(), TIMESTAMP_ASSURANCE_NONE);
+    assert_eq!(assurance.open_dispute_count, 0);
+    assert_eq!(assurance.open_dispute_count, client.get_open_dispute_count(&proof_id));
+    assert_eq!(assurance.envelope_version, METADATA_ENVELOPE_VERSION_DEFAULT);
+    assert_eq!(assurance.issuer_verifiable, true);
+    assert_eq!(assurance.is_issuer_verifiable(), true);
+    assert_eq!(assurance.issuer_verifiable, client.is_issuer_verifiable(&issuer));
+
+    // Deactivate issuer -> issuer_verifiable becomes false
+    client.deactivate_issuer(&admin, &issuer);
+    let assurance_after = client.get_proof_assurance(&proof_id).expect("proof assurance");
+    assert_eq!(assurance_after.issuer_verifiable, false);
+    assert_eq!(assurance_after.is_issuer_verifiable(), false);
+    assert_eq!(assurance_after.issuer_verifiable, client.is_issuer_verifiable(&issuer));
+}
+
+#[test]
+fn test_assurance_registered_source_no_issuer() {
+    let env = Env::default();
+    env.mock_all_auths();
+    env.ledger().set_timestamp(1_000_000);
+
+    let contract_id = env.register(HarpocratesRegistry, ());
+    let client = HarpocratesRegistryClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    let source = Address::generate(&env);
+
+    client.init(&admin);
+
+    let proof_id = bytes32(&env, 0x04);
+    client.register_source(&source, &bytes32(&env, 0x05), &bytes32(&env, 0x06), &proof_id);
+
+    let assurance = client.get_proof_assurance(&proof_id).expect("proof assurance");
+    assert_eq!(assurance.status, ProofVerificationStatus::Valid);
+    assert_eq!(assurance.status, client.get_proof_status(&proof_id));
+    assert_eq!(assurance.tier, TIER_AUTHORITATIVE_SOURCE);
+    assert_eq!(assurance.timestamp_assurance_level, TIMESTAMP_ASSURANCE_NONE);
+    assert_eq!(assurance.open_dispute_count, 0);
+    assert_eq!(assurance.envelope_version, METADATA_ENVELOPE_VERSION_DEFAULT);
+    assert_eq!(assurance.issuer_verifiable, false);
+}
+
+#[test]
+fn test_assurance_with_timestamp_claim_and_envelope() {
+    let env = Env::default();
+    env.mock_all_auths();
+    env.ledger().set_timestamp(1_000_000);
+
+    let contract_id = env.register(HarpocratesRegistry, ());
+    let client = HarpocratesRegistryClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    let source = Address::generate(&env);
+
+    client.init(&admin);
+
+    let proof_id = bytes32(&env, 0x07);
+    client.register_source(&source, &bytes32(&env, 0x08), &bytes32(&env, 0x09), &proof_id);
+
+    // Anchor timestamp claim
+    let attestation_digest = bytes32(&env, 0x0A);
+    client.anchor_timestamp_claim(&source, &proof_id, &attestation_digest, &0u64, &bytes32(&env, 0x00));
+
+    // Store metadata envelope version 2
+    let envelope_hash = bytes32(&env, 0x0B);
+    client.store_metadata_envelope(&source, &proof_id, &2u32, &envelope_hash);
+
+    let assurance = client.get_proof_assurance(&proof_id).expect("proof assurance");
+    assert_eq!(assurance.status, ProofVerificationStatus::Valid);
+    assert_eq!(assurance.status, client.get_proof_status(&proof_id));
+    let claim = client.get_timestamp_claim(&proof_id).expect("timestamp claim");
+    assert_eq!(assurance.timestamp_assurance_level, claim.assurance);
+    assert_eq!(assurance.timestamp_assurance_level, TIMESTAMP_ASSURANCE_INDEPENDENT);
+    assert_eq!(assurance.envelope_version, 2);
+}
+
+#[test]
+fn test_assurance_revoked_proof() {
+    let env = Env::default();
+    env.mock_all_auths();
+    env.ledger().set_timestamp(1_000_000);
+
+    let contract_id = env.register(HarpocratesRegistry, ());
+    let client = HarpocratesRegistryClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    let issuer = Address::generate(&env);
+
+    client.init(&admin);
+    client.add_issuer(&admin, &issuer, &bytes32(&env, 0xAA));
+
+    let proof_id = bytes32(&env, 0x0C);
+    client.register_seal(&issuer, &bytes32(&env, 0x0D), &bytes32(&env, 0x0E), &proof_id);
+
+    client.revoke_proof(&admin, &proof_id);
+
+    let assurance = client.get_proof_assurance(&proof_id).expect("proof assurance");
+    assert_eq!(assurance.status, ProofVerificationStatus::Revoked);
+    assert_eq!(assurance.status, client.get_proof_status(&proof_id));
+}
+
+#[test]
+fn test_assurance_expired_proof() {
+    let env = Env::default();
+    env.mock_all_auths();
+    env.ledger().set_timestamp(1_000_000);
+
+    let contract_id = env.register(HarpocratesRegistry, ());
+    let client = HarpocratesRegistryClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    let issuer = Address::generate(&env);
+
+    client.init(&admin);
+    client.add_issuer(&admin, &issuer, &bytes32(&env, 0xAA));
+    client.set_proof_ttl(&admin, &100);
+
+    let proof_id = bytes32(&env, 0x0F);
+    client.register_seal(&issuer, &bytes32(&env, 0x10), &bytes32(&env, 0x11), &proof_id);
+
+    // Advance ledger timestamp beyond TTL
+    env.ledger().set_timestamp(1_000_000 + 200);
+
+    let assurance = client.get_proof_assurance(&proof_id).expect("proof assurance");
+    assert_eq!(assurance.status, ProofVerificationStatus::Expired);
+    assert_eq!(assurance.status, client.get_proof_status(&proof_id));
+}
+
+#[test]
+fn test_assurance_disputed_proof() {
+    let env = Env::default();
+    env.mock_all_auths();
+    env.ledger().set_timestamp(1_000_000);
+
+    let contract_id = env.register(HarpocratesRegistry, ());
+    let client = HarpocratesRegistryClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    let issuer = Address::generate(&env);
+
+    client.init(&admin);
+    client.add_issuer(&admin, &issuer, &bytes32(&env, 0xAA));
+
+    let proof_id = bytes32(&env, 0x12);
+    client.register_seal(&issuer, &bytes32(&env, 0x13), &bytes32(&env, 0x14), &proof_id);
+
+    assert_eq!(client.get_open_dispute_count(&proof_id), 0);
+
+    let reporter = Address::generate(&env);
+    let reporter_hash = bytes32(&env, 0x15);
+    let evidence_hash = bytes32(&env, 0x16);
+
+    let dispute_id = client.open_dispute(
+        &reporter,
+        &proof_id,
+        &reporter_hash,
+        &evidence_hash,
+        &DisputeReason::IntegrityViolation,
+    );
+    assert_eq!(dispute_id, 1);
+
+    let assurance = client.get_proof_assurance(&proof_id).expect("proof assurance");
+    assert_eq!(assurance.open_dispute_count, 1);
+    assert_eq!(assurance.open_dispute_count, client.get_open_dispute_count(&proof_id));
+    assert_eq!(assurance.status, ProofVerificationStatus::Valid);
+    assert_eq!(assurance.status, client.get_proof_status(&proof_id));
 }

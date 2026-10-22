@@ -11,6 +11,24 @@ from register_auth import ScopedKey, parse_scoped_keys
 @dataclass(frozen=True)
 class AppConfig:
     app_env: str
+    def redacted_summary(self) -> dict[str, any]:
+        """Return a dict representation of the config where secret fields are redacted.
+        Secret fields (API keys, endpoints, tokens) are replaced with a boolean indicating
+        presence (True if set, False otherwise). Non‑secret fields retain their original
+        values.
+        """
+        from dataclasses import asdict
+        secret_fields = {
+            "metrics_token",
+            "tracing_endpoint",
+            "register_api_key",
+            "register_api_key_previous",
+        }
+        raw = asdict(self)
+        for field in secret_fields:
+            if field in raw:
+                raw[field] = raw[field] is not None
+        return raw
     cors_origins: list[str]
     max_content_length: int
     max_video_bytes: int
@@ -27,6 +45,7 @@ class AppConfig:
     ratelimit_register: str
     ratelimit_upload_session: str
     ratelimit_upload_chunk: str
+    ratelimit_verify: str
     release_id: str
     release_network: str
     metrics_enabled: bool
@@ -52,12 +71,20 @@ class AppConfig:
     verifier_cache_max_size: int
     verifier_cache_positive_ttl_seconds: float
     verifier_cache_negative_ttl_seconds: float
+    # Stego process pool and resource limits
+    stego_memory_limit_bytes: int = 536_870_912
+    stego_cpu_limit_seconds: int = 60
+    stego_pool_max_workers: int = 4
     # External evidence fetch safety bounds
-    external_fetch_connect_timeout_seconds: float
-    external_fetch_read_timeout_seconds: float
-    external_fetch_max_response_bytes: int
+    external_fetch_connect_timeout_seconds: float = 5.0
+    external_fetch_read_timeout_seconds: float = 10.0
+    external_fetch_max_response_bytes: int = 65_536
     # Owner-scoped credentials: each key may only register its own sourceAddress.
     register_scoped_keys: tuple[ScopedKey, ...] = ()
+    job_file_ttl_seconds: int = 86_400
+    retention_blob_gc_enabled: bool = False
+    retention_unreferenced_blobs_enabled: bool = False
+
 
 
 def load_config() -> AppConfig:
@@ -100,6 +127,7 @@ def load_config() -> AppConfig:
         ratelimit_register=_str_env("RATELIMIT_REGISTER") or "30 per minute",
         ratelimit_upload_session=_str_env("RATELIMIT_UPLOAD_SESSION") or "60 per minute",
         ratelimit_upload_chunk=_str_env("RATELIMIT_UPLOAD_CHUNK") or "240 per minute",
+        ratelimit_verify=_str_env("RATELIMIT_VERIFY") or "30 per minute",
         release_id=_release_id(os.getenv("HARPOCRATES_RELEASE_ID", "harpocrates-1.0.0")),
         release_network=_release_network(os.getenv("HARPOCRATES_RELEASE_NETWORK", "testnet")),
         metrics_enabled=_bool_env("METRICS_ENABLED", True),
@@ -125,10 +153,16 @@ def load_config() -> AppConfig:
         verifier_cache_max_size=_int_env("VERIFIER_CACHE_MAX_SIZE", 10000),
         verifier_cache_positive_ttl_seconds=_float_env("VERIFIER_CACHE_POSITIVE_TTL_SECONDS", 86400.0),
         verifier_cache_negative_ttl_seconds=_float_env("VERIFIER_CACHE_NEGATIVE_TTL_SECONDS", 300.0),
+        stego_memory_limit_bytes=_int_env("STEGO_MEMORY_LIMIT_BYTES", 536_870_912),
+        stego_cpu_limit_seconds=_int_env("STEGO_CPU_LIMIT_SECONDS", 60),
+        stego_pool_max_workers=_int_env("STEGO_POOL_MAX_WORKERS", 4),
         external_fetch_connect_timeout_seconds=_float_env("EXTERNAL_FETCH_CONNECT_TIMEOUT_SECONDS", 5.0),
         external_fetch_read_timeout_seconds=_float_env("EXTERNAL_FETCH_READ_TIMEOUT_SECONDS", 10.0),
         external_fetch_max_response_bytes=_int_env("EXTERNAL_FETCH_MAX_RESPONSE_BYTES", 65_536),
         register_scoped_keys=parse_scoped_keys(_str_env("REGISTER_SCOPED_KEYS")),
+        job_file_ttl_seconds=_job_file_ttl_env(),
+        retention_blob_gc_enabled=_blob_gc_enabled_env(),
+        retention_unreferenced_blobs_enabled=_blob_gc_enabled_env(),
     )
 
 
@@ -250,3 +284,38 @@ def _retention_batch_size_env(name: str = "HARPOCRATES_RETENTION_BATCH_SIZE", de
     except ValueError as exc:
         raise RuntimeError(f"{name} must be an integer") from exc
     return max(1, min(parsed, RETENTION_BATCH_SIZE_MAX))
+
+
+JOB_FILE_TTL_SECONDS_DEFAULT = 86_400
+
+
+def _job_file_ttl_env(
+    name: str = "HARPOCRATES_JOB_FILE_TTL_SECONDS",
+    default: int = JOB_FILE_TTL_SECONDS_DEFAULT,
+) -> int:
+    """Load HARPOCRATES_JOB_FILE_TTL_SECONDS (default 24h = 86400s)."""
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        parsed = int(raw)
+    except ValueError as exc:
+        raise RuntimeError(f"{name} must be an integer") from exc
+    if parsed < 0:
+        raise RuntimeError(f"{name} must be non-negative")
+    return parsed
+
+
+def _blob_gc_enabled_env() -> bool:
+    """Return whether blob garbage collection is enabled in retention worker."""
+    for var in (
+        "RETENTION_BLOB_GC_ENABLED",
+        "HARPOCRATES_RETENTION_BLOB_GC_ENABLED",
+        "RETENTION_UNREFERENCED_BLOBS_ENABLED",
+        "HARPOCRATES_RETENTION_UNREFERENCED_BLOBS_ENABLED",
+    ):
+        val = os.getenv(var)
+        if val is not None:
+            return val.strip().lower() in {"1", "true", "yes", "on"}
+    return False
+

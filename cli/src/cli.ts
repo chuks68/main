@@ -3,11 +3,24 @@
 import { createReadStream } from 'node:fs'
 import { writeFile } from 'node:fs/promises'
 import { createHash } from 'node:crypto'
+import { resolve } from 'node:path'
 import process from 'node:process'
+import { fileURLToPath } from 'node:url'
 import { StrKey } from '@stellar/stellar-sdk'
+import { asHex32 } from './hashing.js'
 import { createProofManifest, parseManifest, serializeManifest } from './manifest.js'
 import { validateMetadata, fileHash, canonicalMetadataHash, type HarpocratesMetadata } from './metadata.js'
-import { lookupByVideoHash, verifyTransaction } from './stellar-lookup.js'
+import {
+  lookupByVideoHash,
+  lookupProofStatus,
+  resolveContractId,
+  resolveRpcUrl,
+  verifyTransaction,
+  getLineage,
+  getProofStatus,
+  LookupTimeoutError,
+  type ProofLifecycleStatus,
+} from './stellar-lookup.js'
 import { createReceipt, formatReceipt, type VerificationReceipt } from './receipt.js'
 import { classifyVerification } from './normalize.js'
 import { verifyVerificationReceipt, decodeReceiptFromQr, type SignedVerificationReceipt } from './signed-receipt.js'
@@ -18,8 +31,17 @@ import {
   serializeC2paExport,
   type C2paExport,
 } from './c2pa.js'
+import { verifyLineageTree, formatLineageTree } from './verify-lineage.js'
 import { logStructured, redactSensitive } from './logging.js'
+import { createRequire } from 'node:module'
 import { parseCliArgs, CliUsageError, type ParsedArgs } from './args.js'
+import { handleRegister } from './register.js'
+
+function getCliVersion(): string {
+  const require = createRequire(import.meta.url)
+  const pkg = require('../package.json') as { version?: string }
+  return pkg.version ?? '0.0.0'
+}
 
 // ── I/O helpers ───────────────────────────────────────────────────────────
 
@@ -67,8 +89,7 @@ function exit(code: number, message?: string): never {
 
 // ── Main dispatcher ───────────────────────────────────────────────────────
 
-async function main(): Promise<void> {
-  const args = process.argv.slice(2)
+export async function main(args: string[] = process.argv.slice(2)): Promise<void> {
   let parsed: ParsedArgs
   try {
     parsed = parseCliArgs(args)
@@ -82,6 +103,8 @@ async function main(): Promise<void> {
   switch (command) {
     case 'verify':
       return await handleVerify(flags, debugLog)
+    case 'status':
+      return await handleStatus(flags, debugLog)
     case 'manifest':
       return await handleManifest(flags, debugLog)
     case 'hash':
@@ -90,9 +113,14 @@ async function main(): Promise<void> {
       return await handleVerifyReceipt(flags, debugLog)
     case 'c2pa':
       return await handleC2pa(flags, debugLog)
+    case 'verify-lineage':
+      return await handleVerifyLineage(flags, debugLog)
+    case 'register':
+      return await handleRegister(flags, debugLog)
     case 'help':
-    default:
       return printHelp()
+    default:
+      return printUnknownCommand(command)
   }
 }
 
@@ -105,6 +133,7 @@ async function handleVerify(flags: Record<string, string>, debugLog: (event: Rec
   const outputFormat = flags.output || flags.o || 'text'
   const offline = flags.offline === 'true'
   const network = flags.network || 'Test SDF Network ; September 2015'
+  const timeoutMs = parseTimeout(flags.timeout)
 
   if (!contractId || !StrKey.isValidContract(contractId)) {
     exit(8, 'a valid --contract-id is required for verification')
@@ -141,17 +170,19 @@ async function handleVerify(flags: Record<string, string>, debugLog: (event: Rec
     )
   } else {
     try {
-      const txVerification = await verifyTransaction(manifest.transactionRef, contractId, { rpcUrl, sourceAddress })
+      const txVerification = await verifyTransaction(manifest.transactionRef, contractId, { rpcUrl, sourceAddress, timeoutMs })
 
       const chainRecord = await lookupByVideoHash(contractId, manifest.videoHash, {
         rpcUrl,
         sourceAddress,
         networkPassphrase: network,
+        timeoutMs,
       })
 
       const result = classifyVerification(manifest, txVerification, chainRecord)
       receipt = createReceipt(manifest, txVerification, chainRecord, result)
-    } catch {
+    } catch (err) {
+      if (err instanceof LookupTimeoutError) exit(8, 'verification dependency failed: RPC timeout')
       exit(8, 'verification dependency failed')
     }
   }
@@ -174,6 +205,16 @@ async function handleVerify(flags: Record<string, string>, debugLog: (event: Rec
     error: 8,
   }
   exit(exitCodes[receipt.result] ?? 8)
+}
+
+function parseTimeout(raw: string | undefined): number {
+  if (raw === undefined) return 15000
+  if (!/^[0-9]+$/.test(raw)) exit(2, '--timeout must be a positive integer')
+  const value = Number(raw)
+  if (!Number.isSafeInteger(value) || value <= 0) {
+    exit(2, '--timeout must be a positive integer')
+  }
+  return value
 }
 
 async function handleManifest(flags: Record<string, string>, debugLog: (event: Record<string, unknown>) => void): Promise<void> {
@@ -247,26 +288,42 @@ async function handleManifest(flags: Record<string, string>, debugLog: (event: R
 
 async function handleHash(flags: Record<string, string>): Promise<void> {
   const filePath = flags.file || flags.f
+  const outputFormat = flags.output || flags.o || 'text'
 
   if (!filePath) {
     exit(2, '--file is required for hashing')
   }
 
+  if (outputFormat !== 'text' && outputFormat !== 'json') {
+    exit(2, 'invalid --output value: expected "text" or "json"')
+  }
+
   try {
     let hash: string
+    let bytes: number
     if (filePath === '-') {
       const digest = createHash('sha256')
-      for await (const chunk of process.stdin) digest.update(chunk)
+      bytes = 0
+      for await (const chunk of process.stdin) {
+        bytes += Buffer.byteLength(chunk)
+        digest.update(chunk)
+      }
       hash = digest.digest('hex')
     } else {
       hash = await fileHash(filePath)
+      const { stat } = await import('node:fs/promises')
+      bytes = (await stat(filePath)).size
     }
 
-    printJson({
-      algorithm: 'sha256',
-      input: filePath === '-' ? 'stdin' : 'file',
-      hash,
-    })
+    if (outputFormat === 'json') {
+      printJson({
+        algorithm: 'sha256',
+        digest: hash,
+        bytes,
+      })
+    } else {
+      printText(hash)
+    }
   } catch {
     exit(8, 'hashing failed')
   }
@@ -375,20 +432,208 @@ async function handleC2pa(flags: Record<string, string>, debugLog: (event: Recor
   }
 }
 
-function printHelp(): void {
+async function handleVerifyLineage(
+  flags: Record<string, string>,
+  debugLog: (event: Record<string, unknown>) => void,
+): Promise<void> {
+  const outputDigest = flags['output-digest'] || flags.outputDigest
+  const contractId = flags['contract-id'] || flags.contractId
+  const rpcUrl = flags['rpc-url'] || flags.rpcUrl
+  const sourceAddress = flags['source-address'] || flags.sourceAddress || process.env.HARPOCRATES_SOURCE_ADDRESS
+  const network = flags.network || 'Test SDF Network ; September 2015'
+  const outputFormat = flags.output || flags.o || 'text'
+
+  if (!outputDigest) {
+    exit(2, '--output-digest is required for lineage verification')
+  }
+
+  if (!contractId || !StrKey.isValidContract(contractId)) {
+    exit(8, 'a valid --contract-id is required for verification')
+  }
+
+  if (!sourceAddress) {
+    exit(8, 'a source address is required for simulation. Pass --source-address or set HARPOCRATES_SOURCE_ADDRESS')
+  }
+
+  debugLog({
+    action: 'verify-lineage',
+    outputDigest,
+    contractId,
+    network,
+  })
+
+  const fetcher = {
+    getLineage: (digest: string) =>
+      getLineage(contractId, digest, {
+        rpcUrl,
+        networkPassphrase: network,
+        sourceAddress,
+      }),
+    getProofStatus: (proofId: string) =>
+      getProofStatus(contractId, proofId, {
+        rpcUrl,
+        networkPassphrase: network,
+        sourceAddress,
+      }),
+  }
+
+  const result = await verifyLineageTree(outputDigest, fetcher)
+
+  if (outputFormat === 'json') {
+    printJson(result)
+  } else {
+    printText(formatLineageTree(result.root))
+    if (!result.success && result.failureReason) {
+      printText(`\nVerification failed: ${result.failureReason}`)
+    }
+  }
+
+  if (!result.success) {
+    if (result.revokedCount > 0) exit(2, 'an ancestor is revoked')
+    if (result.expiredCount > 0) exit(1, 'an ancestor is expired')
+    if (result.missingCount > 0) exit(3, 'an ancestor is missing')
+    exit(8, result.failureReason ?? 'lineage verification failed')
+  }
+
+  exit(0)
+}
+
+export const STATUS_EXIT_CODES: Record<ProofLifecycleStatus, number> = {
+  registered: 0,
+  expired: 1,
+  revoked: 2,
+  unknown: 3,
+}
+
+export function formatProofStatus(info: {
+  proofId: string
+  contractId: string
+  network: string
+  status: ProofLifecycleStatus
+}): string {
+  return [
+    `Proof ID: ${info.proofId}`,
+    `Contract: ${info.contractId}`,
+    `Network:  ${info.network}`,
+    `Status:   ${info.status}`,
+  ].join('\n')
+}
+
+export async function handleStatus(
+  flags: Record<string, string>,
+  debugLog: (event: Record<string, unknown>) => void = () => {},
+): Promise<void> {
+  const rawProofId = flags['proof-id'] || flags.proofId
+  const contractId = resolveContractId(flags['contract-id'] || flags.contractId)
+  const rpcUrl = resolveRpcUrl(flags['rpc-url'] || flags.rpcUrl)
+  const sourceAddress =
+    flags['source-address'] || flags.sourceAddress || process.env.HARPOCRATES_SOURCE_ADDRESS
+  const network = flags.network || 'Test SDF Network ; September 2015'
+  const outputFormat = flags.output || flags.o || 'text'
+
+  if (!rawProofId) {
+    exit(2, '--proof-id is required for status lookup')
+  }
+
+  let proofId: string
+  try {
+    proofId = asHex32(rawProofId, 'proofId')
+  } catch {
+    exit(2, 'invalid --proof-id: must be a 32-byte hex string')
+  }
+
+  if (outputFormat !== 'text' && outputFormat !== 'json') {
+    exit(2, 'invalid --output: expected "text" or "json"')
+  }
+
+  if (!contractId || !StrKey.isValidContract(contractId)) {
+    exit(8, 'a valid --contract-id is required for status lookup')
+  }
+
+  debugLog({
+    event: 'status.lookup',
+    proofId,
+    contractId,
+    network,
+  })
+
+  let status: ProofLifecycleStatus
+  try {
+    status = await lookupProofStatus(contractId, proofId, {
+      rpcUrl,
+      sourceAddress,
+      networkPassphrase: network,
+    })
+  } catch {
+    exit(8, 'status lookup dependency failed')
+  }
+
+  const payload = {
+    proofId,
+    contractId,
+    network,
+    status,
+  }
+
+  if (outputFormat === 'json') {
+    printJson(payload)
+  } else {
+    printText(formatProofStatus(payload))
+  }
+
+  exit(STATUS_EXIT_CODES[status] ?? 8)
+}
+
+export function helpText(): string {
   const help = `
 Harpocrates CLI – headless verification and proof utilities
 
 Usage:
   harpocrates <command> [options]
+  harpocrates --version
 
 Commands:
   verify         Verify a proof against the Stellar network.
+  status         Report the on-chain lifecycle status of a proof by proof ID.
+  verify-lineage Verify a derivative's full lineage back to registered originals.
+  register       Register a source or seal proof using a local signing key.
   manifest       Create a proof manifest from metadata.
   hash           Compute the SHA-256 hash of a file.
   verify-receipt Verify an offline signed receipt.
   c2pa           Export C2PA authenticity assertions from a proof manifest.
+  version        Print the CLI version.
   help           Show this help message.
+
+Register options:
+  --kind           Proof kind to register: "source" or "seal" (required).
+  --contract-id    Contract ID on Stellar (required).
+  --proof-id       Proof ID to register (required).
+  --video-hash     32-byte hex video hash (required).
+  --source-hash    32-byte hex source hash (required for source proofs).
+  --metadata-hash  32-byte hex metadata hash (required for seal proofs).
+  --rpc-url        Stellar RPC URL (default: testnet).
+  --network        Network passphrase (default: testnet).
+  --signer-file    Path to a file containing the signer secret key.
+  --dry-run        Simulate only; stop before submitting.
+  --output, -o     Output format: "text" (default) or "json".
+  The signer secret is read only from HARPOCRATES_SIGNER_SECRET or --signer-file,
+  never from a flag value, and is never logged.
+
+Status options:
+  --contract-id     Contract ID on Stellar (required).
+  --proof-id        32-byte hex proof ID to inspect (required).
+  --rpc-url         Stellar RPC URL (default: testnet).
+  --source-address  Source address for simulation.
+  --network         Network passphrase (default: testnet).
+  --output, -o      Output format: "text" (default) or "json".
+
+Lineage verification options:
+  --output-digest  32-byte hex digest of the derivative (required).
+  --contract-id    Contract ID on Stellar (required).
+  --rpc-url        Stellar RPC URL (default: testnet).
+  --source-address Source address for simulation.
+  --network        Network passphrase (default: testnet).
+  --output, -o     Output format: "text" (default) or "json".
 
 C2PA export options:
   --manifest       Path to a proof manifest JSON file (use "-" for stdin; required).
@@ -416,6 +661,7 @@ Verify options:
   --source-address  Source address for simulation.
   --output, -o      Output format: "text" (default) or "json".
   --offline         Skip on-chain lookup; validate locally only.
+  --timeout         RPC request timeout in milliseconds (default: 15000).
 
 Manifest options:
   --input, -i       Path to metadata JSON file (use "-" for stdin; required).
@@ -428,33 +674,53 @@ Manifest options:
 
 Hash options:
   --file, -f        Path to the file to hash (use "-" for stdin; required).
+  --output, -o      Output format: "text" (default) or "json".
 
 Environment variables:
   HARPOCRATES_SOURCE_ADDRESS   Source address for Stellar simulation.
+  HARPOCRATES_SIGNER_SECRET    Signer secret key for the register command.
   HARPOCRATES_DEBUG            Equivalent to --debug.
 
 Debugging:
   --debug                      Emit redacted structured diagnostics to stderr.
-                               Sensitive fields (secrets, witnesses, tokens,
-                               credentials) are never logged.
+                                Sensitive fields (secrets, witnesses, tokens,
+                                credentials) are never logged.
 
 Exit codes:
-  0   valid
+  0   valid / registered
   1   expired
   2   revoked
-  3   not_found / missing
+  3   not_found / missing / unknown
   4   network_mismatch
   5   contract_mismatch
   6   pending
   7   failed
   8   error
+      (RPC timeouts during verification also exit with 8)
+  For a full table of every exit code and which commands emit them, see the Exit codes section in cli/README.md.
 `
-  printText(help.trim())
+  return help.trim()
+}
+
+function printHelp(): void {
+  printText(helpText())
   process.exit(0)
 }
 
-main().catch((err) => {
-  void err
-  process.stderr.write('harpocrates: unexpected error\n')
-  process.exit(8)
-})
+function printUnknownCommand(name: string): never {
+  process.stderr.write(`harpocrates: unknown command "${name}"\n`)
+  process.stderr.write('Run "harpocrates help" for usage.\n')
+  process.exit(2)
+}
+
+const isDirectExecution =
+  process.argv[1] !== undefined &&
+  resolve(process.argv[1]) === resolve(fileURLToPath(import.meta.url))
+
+if (isDirectExecution) {
+  main().catch((err) => {
+    void err
+    process.stderr.write('harpocrates: unexpected error\n')
+    process.exit(8)
+  })
+}
