@@ -574,9 +574,95 @@ def list_proof_events(
     return rows, next_cursor
 
 
-def find_proof_events_by_video(video_hash: str) -> list[dict[str, Any]]:
+def find_proof_events_by_video(
+    video_hash: str,
+    limit: int = PROOF_EVENTS_DEFAULT_LIMIT,
+    *,
+    cursor_id: int | None = None,
+) -> tuple[list[dict[str, Any]], str | None]:
     if not database_url():
-        return []
+        return [], None
+
+    page_size = clamp_proof_events_limit(limit)
+    fetch_size = page_size + 1
+
+    with get_connection() as connection:
+        with connection.cursor() as cursor:
+            if cursor_id is None:
+                cursor.execute(
+                    """
+                    select
+                        id,
+                        event_type,
+                        file_name,
+                        video_hash,
+                        metadata_hash,
+                        proof_id,
+                        tier,
+                        embedded_hash,
+                        tx_hash,
+                        tx_status,
+                        source_address,
+                        contract_id,
+                        retention_class,
+                        expires_at,
+                        legal_hold,
+                        metadata,
+                        time_attestation,
+                        claimed_capture_time,
+                        created_at
+                    from proof_events
+                    where video_hash = %s
+                    order by id desc
+                    limit %s;
+                    """,
+                    (video_hash, fetch_size),
+                )
+            else:
+                cursor.execute(
+                    """
+                    select
+                        id,
+                        event_type,
+                        file_name,
+                        video_hash,
+                        metadata_hash,
+                        proof_id,
+                        tier,
+                        embedded_hash,
+                        tx_hash,
+                        tx_status,
+                        source_address,
+                        contract_id,
+                        retention_class,
+                        expires_at,
+                        legal_hold,
+                        metadata,
+                        time_attestation,
+                        claimed_capture_time,
+                        created_at
+                    from proof_events
+                    where video_hash = %s
+                      and id < %s
+                    order by id desc
+                    limit %s;
+                    """,
+                    (video_hash, cursor_id, fetch_size),
+                )
+            rows = [dict(row) for row in cursor.fetchall()]
+
+    next_cursor: str | None = None
+    if len(rows) > page_size:
+        rows = rows[:page_size]
+        next_cursor = encode_proof_events_cursor(int(rows[-1]["id"]))
+    return rows, next_cursor
+
+
+def find_proof_events_by_proof_id(proof_id: str) -> list[dict[str, Any]]:
+    if not database_url():
+        return [
+            dict(r) for r in _INDEXED_EVENTS.values() if r.get("proof_id") == proof_id
+        ]
 
     with get_connection() as connection:
         with connection.cursor() as cursor:
@@ -601,12 +687,13 @@ def find_proof_events_by_video(video_hash: str) -> list[dict[str, Any]]:
                     metadata,
                     time_attestation,
                     claimed_capture_time,
+                    event_index,
                     created_at
                 from proof_events
-                where video_hash = %s
+                where proof_id = %s
                 order by id desc;
                 """,
-                (video_hash,),
+                (proof_id,),
             )
             return [dict(row) for row in cursor.fetchall()]
 
@@ -1017,6 +1104,28 @@ def set_legal_hold(proof_id: str, hold: bool) -> None:
         connection.commit()
 
 
+def count_expired_events() -> int:
+    """Return how many proof events ``purge_expired_events`` would delete.
+
+    Read-only; uses the same filter as the purge so retention dry runs match.
+    """
+    if not database_url():
+        return 0
+    with get_connection() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                select count(*) as expired
+                from proof_events
+                where expires_at is not null
+                  and expires_at <= now()
+                  and legal_hold = false;
+                """
+            )
+            row = cursor.fetchone()
+    return int(row["expired"]) if row else 0
+
+
 def purge_expired_events(batch_size: int = RETENTION_BATCH_DEFAULT_SIZE) -> list[dict[str, Any]]:
     """Delete proof events past their expiration that are not on legal hold.
 
@@ -1074,6 +1183,7 @@ def enqueue_job(job_type: str, payload: dict[str, Any]) -> int:
         "_trace_context": job_trace_context(),
         "status": "pending",
         "result": None,
+        "progress": None,
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
     return job_id
@@ -1108,13 +1218,61 @@ def lease_job(
     return None
 
 
-def heartbeat_job(job_id: int, progress: float = 0.0, lease_duration: int = 300) -> None:
-    """Record a heartbeat against an in-memory job lease."""
-    del lease_duration
+def heartbeat_job(job_id: int, progress: float | None = None, lease_duration: int = 300) -> None:
+    """Record a heartbeat against an in-memory job lease.
+
+    The heartbeat only extends the lease. Progress is reported separately via
+    :func:`report_job_progress`; ``progress`` is accepted for backwards
+    compatibility and ignored so a heartbeat never overwrites real progress.
+    """
+    del lease_duration, progress
     job = _JOBS.get(job_id)
     if job and job.get("status") == "running":
-        job["progress"] = progress
         job["heartbeat_at"] = datetime.now(timezone.utc).isoformat()
+
+
+# Processors may call report_job_progress as often as they like (for example
+# once per decoded frame); updates are stored at most once per this interval.
+JOB_PROGRESS_MIN_INTERVAL_SECONDS = 1.0
+JOB_PROGRESS_PHASE_MAX_LENGTH = 64
+
+
+def report_job_progress(
+    job_id: int,
+    phase: str,
+    percent: float | None = None,
+    *,
+    now: float | None = None,
+) -> bool:
+    """Record ``{"phase", "percent"}`` progress for a running job.
+
+    ``phase`` is a short machine-readable step name (for example
+    ``"embedding"``); ``percent`` is 0-100 or ``None`` when the step has no
+    measurable fraction. Updates are throttled to at most one per
+    ``JOB_PROGRESS_MIN_INTERVAL_SECONDS`` per job, and only running jobs are
+    updated. Returns True when the update was stored.
+    """
+    job = _JOBS.get(job_id)
+    if not job or job.get("status") != "running":
+        return False
+    if not isinstance(phase, str) or not phase.strip():
+        raise ValueError("progress phase must be a non-empty string")
+    phase = phase.strip()[:JOB_PROGRESS_PHASE_MAX_LENGTH]
+    if percent is not None:
+        try:
+            percent = float(percent)
+        except (TypeError, ValueError):
+            raise ValueError("progress percent must be a number or None") from None
+        if percent != percent:  # NaN
+            raise ValueError("progress percent must be a number or None")
+        percent = round(min(100.0, max(0.0, percent)), 1)
+    current = time.monotonic() if now is None else now
+    last = job.get("_progress_at")
+    if last is not None and current - last < JOB_PROGRESS_MIN_INTERVAL_SECONDS:
+        return False
+    job["_progress_at"] = current
+    job["progress"] = {"phase": phase, "percent": percent}
+    return True
 
 
 def complete_job(job_id: int, result: Any = None) -> None:
@@ -1139,3 +1297,271 @@ def fail_job(job_id: int, error: str, *, is_fatal: bool = False) -> None:
     else:
         job["status"] = "pending"
         job.pop("worker_id", None)
+
+
+def get_job_queue_metrics() -> dict[str, Any]:
+    """Return counts per job type and state plus the age of the oldest queued job.
+
+    Cheap aggregate query grouped by type and status, utilizing the jobs index.
+    Skips gracefully (returns empty data) when no database is configured or
+    when the database query fails.
+
+    Returns:
+        dict with:
+            "counts": {(type, state): count, ...}
+            "oldest_queued_seconds": {type: seconds, ...}
+    """
+    if not database_url():
+        return {"counts": {}, "oldest_queued_seconds": {}}
+
+    try:
+        with get_connection() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT
+                        type,
+                        status AS state,
+                        COUNT(*) AS count,
+                        EXTRACT(EPOCH FROM (NOW() - MIN(created_at))) FILTER (WHERE status = 'pending') AS oldest_queued_seconds
+                    FROM jobs
+                    GROUP BY type, status;
+                    """
+                )
+                rows = cursor.fetchall()
+    except Exception as exc:
+        logger.warning("Failed to query job queue metrics: %s", exc)
+        return {"counts": {}, "oldest_queued_seconds": {}}
+
+    counts: dict[tuple[str, str], int] = {}
+    oldest_queued: dict[str, float] = {}
+
+    for row in rows:
+        if isinstance(row, dict):
+            j_type = str(row.get("type", ""))
+            state = str(row.get("state") or row.get("status", ""))
+            cnt = int(row.get("count", 0))
+            oldest_sec = row.get("oldest_queued_seconds")
+        elif hasattr(row, "__getitem__"):
+            try:
+                j_type = str(row["type"])
+                state = str(row["state"] if "state" in row else row["status"])
+                cnt = int(row["count"])
+                oldest_sec = row.get("oldest_queued_seconds") if hasattr(row, "get") else row["oldest_queued_seconds"]
+            except (KeyError, TypeError):
+                j_type = str(row[0])
+                state = str(row[1])
+                cnt = int(row[2])
+                oldest_sec = row[3] if len(row) > 3 else None
+        else:
+            continue
+
+        if not j_type or not state:
+            continue
+
+        counts[(j_type, state)] = cnt
+        if oldest_sec is not None:
+            oldest_queued[j_type] = max(0.0, float(oldest_sec))
+
+    for j_type, _ in counts:
+        if j_type not in oldest_queued:
+            oldest_queued[j_type] = 0.0
+
+    return {
+        "counts": counts,
+        "oldest_queued_seconds": oldest_queued,
+    }
+
+
+get_job_metrics = get_job_queue_metrics
+
+
+_INDEXED_EVENTS: dict[tuple[str, int], dict[str, Any]] = {}
+_INDEXER_STATE: dict[str, dict[str, Any]] = {}
+_mock_indexed_id = 100000
+
+
+def insert_indexed_proof_event(
+    *,
+    event_type: str,
+    tx_hash: str,
+    event_index: int,
+    proof_id: str | None = None,
+    contract_id: str | None = None,
+    tx_status: str | None = "confirmed",
+    video_hash: str | None = None,
+    metadata_hash: str | None = None,
+    metadata: dict[str, Any] | None = None,
+    created_at: datetime | None = None,
+) -> tuple[dict[str, Any], bool]:
+    """Insert an on-chain indexed proof event idempotently.
+
+    Returns ``(row, created)`` where *created* is ``True`` when a new row was
+    written and ``False`` when an existing row with the same ``(tx_hash, event_index)``
+    was already present.
+    """
+    global _mock_indexed_id
+    if not database_url():
+        key = (tx_hash, event_index)
+        if key in _INDEXED_EVENTS:
+            return dict(_INDEXED_EVENTS[key]), False
+        _mock_indexed_id += 1
+        now = created_at or datetime.now(timezone.utc)
+        row = {
+            "id": _mock_indexed_id,
+            "event_type": event_type,
+            "proof_id": proof_id,
+            "video_hash": video_hash,
+            "metadata_hash": metadata_hash,
+            "tx_hash": tx_hash,
+            "tx_status": tx_status,
+            "contract_id": contract_id,
+            "event_index": event_index,
+            "metadata": metadata,
+            "created_at": now,
+        }
+        _INDEXED_EVENTS[key] = row
+        return dict(row), True
+
+    idempotency_key = f"indexer:{tx_hash}:{event_index}"
+    with get_connection() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                insert into proof_events (
+                    event_type,
+                    proof_id,
+                    video_hash,
+                    metadata_hash,
+                    tx_hash,
+                    tx_status,
+                    contract_id,
+                    event_index,
+                    idempotency_key,
+                    metadata,
+                    created_at
+                )
+                values (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, coalesce(%s, now()))
+                on conflict (tx_hash, event_index)
+                where tx_hash is not null and event_index is not null
+                do nothing
+                returning
+                    id,
+                    event_type,
+                    file_name,
+                    video_hash,
+                    metadata_hash,
+                    proof_id,
+                    tier,
+                    embedded_hash,
+                    tx_hash,
+                    tx_status,
+                    source_address,
+                    contract_id,
+                    retention_class,
+                    expires_at,
+                    legal_hold,
+                    metadata,
+                    time_attestation,
+                    claimed_capture_time,
+                    event_index,
+                    created_at;
+                """,
+                (
+                    event_type,
+                    proof_id,
+                    video_hash,
+                    metadata_hash,
+                    tx_hash,
+                    tx_status,
+                    contract_id,
+                    event_index,
+                    idempotency_key,
+                    Jsonb(metadata) if metadata is not None else None,
+                    created_at,
+                ),
+            )
+            row = cursor.fetchone()
+            if row is not None:
+                connection.commit()
+                return dict(row), True
+
+            # Existing event lookup on conflict
+            cursor.execute(
+                """
+                select
+                    id,
+                    event_type,
+                    file_name,
+                    video_hash,
+                    metadata_hash,
+                    proof_id,
+                    tier,
+                    embedded_hash,
+                    tx_hash,
+                    tx_status,
+                    source_address,
+                    contract_id,
+                    retention_class,
+                    expires_at,
+                    legal_hold,
+                    metadata,
+                    time_attestation,
+                    claimed_capture_time,
+                    event_index,
+                    created_at
+                from proof_events
+                where tx_hash = %s and event_index = %s
+                limit 1;
+                """,
+                (tx_hash, event_index),
+            )
+            existing = cursor.fetchone()
+        connection.rollback()
+
+    if existing:
+        return dict(existing), False
+    raise RuntimeError(f"Conflict on tx {tx_hash}:{event_index} but row not found")
+
+
+def get_indexer_cursor(indexer_id: str = "soroban_events") -> str | None:
+    if not database_url():
+        return _INDEXER_STATE.get(indexer_id, {}).get("cursor")
+
+    with get_connection() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "select cursor from indexer_state where id = %s;",
+                (indexer_id,),
+            )
+            row = cursor.fetchone()
+            return row["cursor"] if row else None
+
+
+def save_indexer_cursor(
+    indexer_id: str = "soroban_events",
+    cursor: str = "",
+    ledger: int | None = None,
+) -> None:
+    if not database_url():
+        _INDEXER_STATE[indexer_id] = {
+            "cursor": cursor,
+            "ledger": ledger,
+            "updated_at": datetime.now(timezone.utc),
+        }
+        return
+
+    with get_connection() as connection:
+        with connection.cursor() as cursor_db:
+            cursor_db.execute(
+                """
+                insert into indexer_state (id, cursor, ledger, updated_at)
+                values (%s, %s, %s, now())
+                on conflict (id) do update
+                set cursor = excluded.cursor,
+                    ledger = excluded.ledger,
+                    updated_at = excluded.updated_at;
+                """,
+                (indexer_id, cursor, ledger),
+            )
+        connection.commit()

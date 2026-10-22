@@ -65,7 +65,7 @@ _VALID_METADATA: dict = {
 
 
 def _video_upload() -> tuple:
-    return (io.BytesIO(b"video bytes"), "evidence.mp4", "video/mp4")
+    return (io.BytesIO(b"\x00\x00\x00\x18ftypmp42" + b"\x00" * 20), "evidence.mp4", "video/mp4")
 
 
 @contextlib.contextmanager

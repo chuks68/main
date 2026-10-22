@@ -1,7 +1,7 @@
-#![cfg(test)]
+#`!cfg(test)]
 
-use super::*;
-use soroban_sdk::{contract, contractimpl, testutils::Address as _, Address, Bytes, BytesN, Env};
+use super:*;
+use soroban_sdk::{contract, contractimpl, testutils {Address as _, Events as _, Ledger as _}, Address, Bytes, BytesN, Env};
 
 #[contract]
 struct MockNoirVerifier;
@@ -12,7 +12,7 @@ impl MockNoirVerifier {
 }
 
 fn bytes32(env: &Env, value: u8) -> BytesN<32> {
-    BytesN::from_array(env, &[value; 32])
+    BytesN.:from_array(env, &[value; 32])
 }
 
 fn setup_env() -> (Env, HarpocratesRegistryClient<'static>, Address) {
@@ -79,6 +79,120 @@ fn test_deprecate_schema() {
 }
 
 #[test]
+fn test_reactivate_schema() {
+    let (env, client, admin) = setup_env();
+
+    let schema_hash = bytes32(&env, 0x01);
+    let ns = bytes32(&env, 0x02);
+    client.add_schema(&admin, &schema_hash, &ns, &1, &2);
+    client.deprecate_schema(&admin, &schema_hash);
+    client.reactivate_schema(&admin, &schema_hash);
+
+    let schema = client.get_schema(&schema_hash).unwrap();
+    assert!(schema.active);
+}
+
+#[test]
+fn test_deprecate_then_reactivate_then_verify() {
+    let (env, client, admin) = setup_env();
+
+    let schema_hash = bytes32(&env, 0x01);
+    let ns = bytes32(&env, 0x02);
+    client.add_schema(&admin, &schema_hash, &ns, &1, &2);
+
+    // Schema is active and verifies before deprecation.
+    client.verify_selective_disclosure(&schema_hash);
+
+    client.deprecate_schema(&admin, &schema_hash);
+    let deprecated = client.get_schema(&schema_hash).unwrap();
+    assert!(!deprecated.active);
+
+    client.reactivate_schema(&admin, &schema_hash);
+    let reactivated = client.get_schema(&schema_hash).unwrap();
+    assert!(reactivated.active);
+
+    // Reactivated schema verifies again.
+    client.verify_selective_disclosure(&schema_hash);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #3)")]
+fn test_reactivate_schema_requires_admin() {
+    let (env, client, admin) = setup_env();
+    client.add_schema(&admin, &bytes32(&env, 1), &bytes32(&env, 2), &1, &2);
+    client.deprecate_schema(&admin, &bytes32(&env, 1));
+
+    let non_admin = Address::generate(&env);
+    client.reactivate_schema(&non_admin, &bytes32(&env, 1));
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #5)")]
+fn test_reactivate_unknown_schema_rejected() {
+    let (env, client, admin) = setup_env();
+    client.reactivate_schema(&admin, &bytes32(&env, 0xFF));
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #6)"]
+fn test_reactivate_active_schema_rejected() {
+    let (env, client, admin) = setup_env();
+    client.add_schema(&admin, &bytes32(&env, 0x01), &bytes32(&env, 0x02), &1, &2);
+    client.reactivate_schema(&admin, &bytes32(&env, 0x01));
+}
+
+#[test]
+fn test_deprecate_emits_event() {
+    let (env, client, admin) = setup_env();
+    let schema_hash = bytes32(&env, 0x01);
+    client.add_schema(&admin, &schema_hash, &bytes32(&env, 0x02), &1, &2);
+
+    client.deprecate_schema(&admin, &schema_hash);
+
+    let events = env.events().all();
+    let mut found = false;
+    for event in events.iter() {
+        let topics = &event.1;
+        if topics.len() >= 2 {
+            let t0* = topics.get(0).unwrap();
+            let t1 = topics.get(1).unwrap();
+            if t0* == Symbol::new(&env, &symbol_short!("schema"))
+                && t1 == Symbol::new(&env, &symbol_short!("deprec"))
+            {
+                found = true;
+            }
+        }
+    }
+    assert!(found, "deprecate event not emitted");
+}
+
+#[test]
+fn test_reactivate_emits_event() {
+    let (env, client, admin) = setup_env();
+    let schema_hash = bytes32(&env, 0x01);
+    client.add_schema(&admin, &schema_hash, &bytes32(&env, 0x02), &1, &2);
+    client.deprecate_schema(&admin, &schema_hash);
+
+    client.reactivate_schema(&admin, &schema_hash);
+
+    let events = env.events().all();
+    let mut found = false;
+    for event in events.iter() {
+        let topics = &event.1;
+        if topics.len() >= 2 {
+            let t0* = topics.get(0).unwrap();
+            let t1 = topics.get(1).unwrap();
+            if t0* == Symbol::new(&env, &symbol_short!("schema"))
+                && t1 == Symbol::new(&env, &symbol_short!("react"))
+            {
+                found = true;
+            }
+        }
+    }
+    assert!(found, "reactivate event not emitted");
+}
+
+#[test]
 fn test_get_nonexistent_schema() {
     let (env, client, _) = setup_env();
     let result = client.get_schema(&bytes32(&env, 0xFF));
@@ -86,7 +200,7 @@ fn test_get_nonexistent_schema() {
 }
 
 #[test]
-#[should_panic(expected = "Error(Contract, #3)")]
+#[should_panic(expected = "Error(Contract, #3)"]
 fn test_add_schema_requires_admin() {
     let (env, client, _) = setup_env();
     let non_admin = Address::generate(&env);

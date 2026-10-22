@@ -32,8 +32,18 @@ export {
 export type { HarpocratesMetadata, IdentityTier } from './metadata.js'
 export { createProofManifest, serializeManifest, parseManifest } from './manifest.js'
 export type { ProofManifest, ManifestInput } from './manifest.js'
-export { lookupByVideoHash, verifyTransaction } from './stellar-lookup.js'
-export type { ChainProofRecord, StellarLookupOptions, TransactionVerification } from './stellar-lookup.js'
+export {
+  lookupByVideoHash,
+  lookupProofStatus,
+  normalizeProofStatus,
+  verifyTransaction,
+} from './stellar-lookup.js'
+export type {
+  ChainProofRecord,
+  ProofLifecycleStatus,
+  StellarLookupOptions,
+  TransactionVerification,
+} from './stellar-lookup.js'
 export { createReceipt, formatReceipt } from './receipt.js'
 export type { VerificationReceipt, VerificationResult } from './receipt.js'
 export { computeResult, networkName } from './normalize.js'
@@ -59,3 +69,12 @@ export {
   c2paExportDigest,
 } from './c2pa.js'
 export type { C2paExport, C2paExportOptions, C2paAssertion } from './c2pa.js'
+export { getLineage, getProofStatus } from './stellar-lookup.js'
+export type { LineageRecord, ProofStatus } from './stellar-lookup.js'
+export {
+  verifyLineageTree,
+  formatLineageTree,
+  MAX_LINEAGE_DEPTH,
+  MAX_LINEAGE_FANOUT,
+} from './verify-lineage.js'
+export type { LineageNode, LineageTreeResult, LineageFetcher } from './verify-lineage.js'
